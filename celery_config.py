@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import multiprocessing
 from config.rate_limits import get_celery_rate_limit
 
-load_dotenv()
+load_dotenv(override=False)  # Don't override Docker environment variables
 
 # Initialize Celery app
 celery_app = Celery(

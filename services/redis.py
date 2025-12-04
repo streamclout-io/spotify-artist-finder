@@ -1,10 +1,15 @@
 from redis.asyncio import Redis
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 import time
 import logging
 from config.rate_limits import get_redis_rate_limit
 
 logger = logging.getLogger(__name__)
+
+# Batch ingestion configuration
+BATCH_SIZE = 20
+INGESTION_API_URL = "https://apiv2.streamclout.io/fetch/artists/full/batch"
+MAX_ALBUMS = 500
 
 class RedisService:
     def __init__(self, redis_url: str, max_workers: int = 10):
@@ -17,6 +22,7 @@ class RedisService:
         self.active_searches_key = "active_searches"
         self.active_searches_timestamps = f"{self.active_searches_key}:timestamps"
         self.requests_key = "api_requests"  # Using this as our main sorted set for requests
+        self.pending_artists_key = "pending_artist_ids"  # List for batch ingestion
         rate_limit_config = get_redis_rate_limit()
         self.rate_limit_window = rate_limit_config["rate_limit_window"]
         self.rate_limit_max = rate_limit_config["rate_limit_max"]
@@ -305,3 +311,51 @@ class RedisService:
                     await self.remove_active_search(search)
         except Exception as e:
             logger.error(f"Error cleaning up stale searches: {str(e)}")
+
+    # Batch Ingestion Methods
+    async def add_pending_artists(self, artist_ids: List[str]) -> List[str]:
+        """
+        Add artist IDs to pending list and return a batch if we have 20+ artists.
+        Returns a list of artist IDs to send to the ingestion API (empty if < 20).
+        """
+        if not self.redis:
+            await self.init()
+
+        if not artist_ids:
+            return []
+
+        try:
+            # Add all artist IDs to the pending list
+            await self.redis.rpush(self.pending_artists_key, *artist_ids)
+
+            # Check current count
+            count = await self.redis.llen(self.pending_artists_key)
+            logger.info(f"Pending artists count: {count}")
+
+            # If we have enough for a batch, pop them
+            if count >= BATCH_SIZE:
+                batch = []
+                for _ in range(BATCH_SIZE):
+                    artist_id = await self.redis.lpop(self.pending_artists_key)
+                    if artist_id:
+                        batch.append(artist_id)
+
+                logger.info(f"Returning batch of {len(batch)} artists for ingestion")
+                return batch
+
+            return []
+
+        except Exception as e:
+            logger.error(f"Error adding pending artists: {str(e)}")
+            return []
+
+    async def get_pending_artist_count(self) -> int:
+        """Get current count of pending artists"""
+        if not self.redis:
+            await self.init()
+
+        try:
+            return await self.redis.llen(self.pending_artists_key)
+        except Exception as e:
+            logger.error(f"Error getting pending artist count: {str(e)}")
+            return 0

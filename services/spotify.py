@@ -17,7 +17,7 @@ class SpotifyClient:
         self,
         client_id: str,
         client_secret: str,
-        redis_url: str = "redis://localhost",
+        redis_url: str = "redis://localhost:6379/0",
         base_url: str = "https://api.spotify.com/v1",
         auth_url: str = "https://accounts.spotify.com/api/token",
         max_retries: int = 3,

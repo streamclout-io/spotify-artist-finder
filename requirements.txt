@@ -48,3 +48,4 @@ typing-extensions==4.12.2
 tzdata==2025.1
 vine==5.1.0
 wcwidth==0.2.13
+uvicorn[standard]==0.34.0

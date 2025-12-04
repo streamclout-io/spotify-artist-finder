@@ -49,7 +49,7 @@ def get_spotify_client():
 
 async def get_redis_service():
     redis_service = RedisService(
-        redis_url=os.getenv('REDIS_URL', 'redis://localhost')
+        redis_url=os.getenv('REDIS_URL', 'redis://localhost:6379/0')
     )
     await redis_service.init()
     try:

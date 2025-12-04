@@ -6,7 +6,7 @@ from models.database import SearchProgress
 from services.spotify import SpotifyClient
 from services.database import DatabaseService
 from database.database import AsyncSessionLocal
-from services.redis import RedisService
+from services.redis import RedisService, INGESTION_API_URL, MAX_ALBUMS
 import os
 from dotenv import load_dotenv
 import httpx
@@ -17,6 +17,32 @@ from services.search_generator import SearchStringGenerator
 
 logger = logging.getLogger(__name__)
 load_dotenv()
+
+
+async def send_batch_to_ingestion_api(artist_ids: list[str]) -> bool:
+    """Send a batch of artist IDs to the ingestion API"""
+    if not artist_ids:
+        return True
+
+    payload = {
+        "artist_ids": artist_ids,
+        "max_albums": MAX_ALBUMS,
+        "force": False,
+        "trigger_compaction": False
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(INGESTION_API_URL, json=payload)
+            response.raise_for_status()
+            logger.info(f"Successfully sent batch of {len(artist_ids)} artists to ingestion API")
+            return True
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Ingestion API HTTP error: {e.response.status_code} - {e.response.text}")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to send batch to ingestion API: {str(e)}")
+        return False
 
 @celery_app.task(name='tasks.generate_search_strings')
 def generate_search_strings():
@@ -31,7 +57,7 @@ def generate_search_strings():
 
 async def _async_generate_search_strings():
     """Async implementation of search string generation"""
-    redis_service = RedisService(os.getenv('REDIS_URL', 'redis://localhost'))
+    redis_service = RedisService(os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
     await redis_service.init()
     
     try:
@@ -115,12 +141,13 @@ async def _async_search_artist_string(search_string: str):
         spotify_client = SpotifyClient(
             client_id=os.getenv('SPOTIFY_CLIENT_ID'),
             client_secret=os.getenv('SPOTIFY_CLIENT_SECRET'),
+            redis_url=os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
             bearer_token=os.getenv('SPOTIFY_BEARER_TOKEN'),
             rate_limit_window=30,
             rate_limit_max=10
         )
         
-        redis_service = RedisService(os.getenv('REDIS_URL', 'redis://localhost'))
+        redis_service = RedisService(os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
         await redis_service.init()
         
         offset = 0
@@ -160,8 +187,15 @@ async def _async_search_artist_string(search_string: str):
                 logger.info(f"Found {current_batch_size} artists for {search_string} at offset {offset}")
                 
                 if result.artists:
-                    await db_service.upsert_artists(result.artists)
+                    # upsert_artists now returns only NEW artist IDs
+                    new_artist_ids = await db_service.upsert_artists(result.artists)
                     total_artists.extend(result.artists)
+
+                    # Add new artists to pending batch and check if we need to send
+                    if new_artist_ids:
+                        batch_to_send = await redis_service.add_pending_artists(list(new_artist_ids))
+                        if batch_to_send:
+                            await send_batch_to_ingestion_api(batch_to_send)
                 
                 if current_batch_size == 0 or current_batch_size < 50:
                     break
@@ -250,7 +284,7 @@ async def _queue_next_search(redis_service: RedisService):
 )
 async def _cleanup_failed_search(search_string: str):
     """Clean up Redis after a failed search with retry logic"""
-    redis_service = RedisService(os.getenv('REDIS_URL', 'redis://localhost'))
+    redis_service = RedisService(os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
     await redis_service.init()
     try:
         await redis_service.remove_active_search(search_string)

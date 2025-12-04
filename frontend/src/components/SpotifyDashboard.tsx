@@ -24,7 +24,8 @@ const SpotifyDashboard = () => {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const statusResponse = await fetch('http://localhost:8000/status', {
+        const apiUrl = import.meta.env.VITE_API_URL || '/api';
+        const statusResponse = await fetch(`${apiUrl}/status`, {
           method: 'GET',
           headers: {
             'Accept': 'application/json',
