@@ -18,9 +18,12 @@ from services.search_generator import SearchStringGenerator
 logger = logging.getLogger(__name__)
 load_dotenv()
 
+# Get the service bypass secret for API authentication
+SERVICE_BYPASS_SECRET = os.getenv('SERVICE_BYPASS_SECRET', '')
+
 
 async def send_batch_to_ingestion_api(artist_ids: list[str]) -> bool:
-    """Send a batch of artist IDs to the ingestion API"""
+    """Send a batch of artist IDs to the ingestion API with signed request"""
     if not artist_ids:
         return True
 
@@ -31,9 +34,14 @@ async def send_batch_to_ingestion_api(artist_ids: list[str]) -> bool:
         "trigger_compaction": False
     }
 
+    headers = {
+        'Content-Type': 'application/json',
+        'X-Service-Secret': SERVICE_BYPASS_SECRET,
+    }
+
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(INGESTION_API_URL, json=payload)
+            response = await client.post(INGESTION_API_URL, json=payload, headers=headers)
             response.raise_for_status()
             logger.info(f"Successfully sent batch of {len(artist_ids)} artists to ingestion API")
             return True
@@ -42,6 +50,35 @@ async def send_batch_to_ingestion_api(artist_ids: list[str]) -> bool:
         return False
     except Exception as e:
         logger.error(f"Failed to send batch to ingestion API: {str(e)}")
+        return False
+
+
+async def send_genres_to_api(genres_map: dict[str, list[str]]) -> bool:
+    """Send a batch of artist genres to the genres API endpoint"""
+    if not genres_map:
+        return True
+
+    headers = {
+        'Content-Type': 'application/json',
+        'X-Service-Secret': SERVICE_BYPASS_SECRET,
+    }
+
+    # Base URL from INGESTION_API_URL, replace the endpoint
+    base_url = INGESTION_API_URL.rsplit('/fetch/', 1)[0]
+    genres_url = f"{base_url}/db/insert/artist-genres"
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(genres_url, json=genres_map, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+            logger.info(f"Successfully sent genres for {result.get('count', len(genres_map))} artists to genres API")
+            return True
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Genres API HTTP error: {e.response.status_code} - {e.response.text}")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to send genres to API: {str(e)}")
         return False
 
 @celery_app.task(name='tasks.generate_search_strings')
@@ -196,6 +233,18 @@ async def _async_search_artist_string(search_string: str):
                         batch_to_send = await redis_service.add_pending_artists(list(new_artist_ids))
                         if batch_to_send:
                             await send_batch_to_ingestion_api(batch_to_send)
+
+                        # Collect genres for new artists and batch them (skip empty)
+                        new_artist_ids_set = set(new_artist_ids)
+                        genres_map = {
+                            artist.id: artist.genres
+                            for artist in result.artists
+                            if artist.id in new_artist_ids_set and artist.genres
+                        }
+                        if genres_map:
+                            genres_batch = await redis_service.add_pending_genres(genres_map)
+                            if genres_batch:
+                                await send_genres_to_api(genres_batch)
                 
                 if current_batch_size == 0 or current_batch_size < 50:
                     break

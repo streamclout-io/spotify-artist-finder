@@ -56,6 +56,7 @@ services:
     environment:
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
+      - SERVICE_BYPASS_SECRET=${SERVICE_BYPASS_SECRET}
       - DB_USER=${DB_USER:-spotify}
       - DB_PASSWORD=${DB_PASSWORD:-spotify}
       - DB_HOST=postgres

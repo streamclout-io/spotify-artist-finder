@@ -7,12 +7,12 @@ from config.rate_limits import get_redis_rate_limit
 logger = logging.getLogger(__name__)
 
 # Batch ingestion configuration
-BATCH_SIZE = 20
+BATCH_SIZE = 10
 INGESTION_API_URL = "https://apiv2.streamclout.io/fetch/artists/full/batch"
 MAX_ALBUMS = 500
 
 class RedisService:
-    def __init__(self, redis_url: str, max_workers: int = 10):
+    def __init__(self, redis_url: str, max_workers: int = 20):
         self.redis: Optional[Redis] = None
         self.redis_url = redis_url
         self.max_workers = max_workers
@@ -23,6 +23,7 @@ class RedisService:
         self.active_searches_timestamps = f"{self.active_searches_key}:timestamps"
         self.requests_key = "api_requests"  # Using this as our main sorted set for requests
         self.pending_artists_key = "pending_artist_ids"  # List for batch ingestion
+        self.pending_genres_key = "pending_artist_genres"  # Hash for genre batching
         rate_limit_config = get_redis_rate_limit()
         self.rate_limit_window = rate_limit_config["rate_limit_window"]
         self.rate_limit_max = rate_limit_config["rate_limit_max"]
@@ -358,4 +359,64 @@ class RedisService:
             return await self.redis.llen(self.pending_artists_key)
         except Exception as e:
             logger.error(f"Error getting pending artist count: {str(e)}")
+            return 0
+
+    # Genre Batching Methods
+    async def add_pending_genres(self, genres_map: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        """
+        Add artist genres to pending hash and return a batch if we have enough.
+        Returns a dict of artist_id -> genres to send to the API (empty if < BATCH_SIZE).
+        """
+        if not self.redis:
+            await self.init()
+
+        if not genres_map:
+            return {}
+
+        try:
+            import json
+            # Add all genres to the pending hash (artist_id -> JSON encoded genres list)
+            for artist_id, genres in genres_map.items():
+                await self.redis.hset(self.pending_genres_key, artist_id, json.dumps(genres))
+
+            # Check current count
+            count = await self.redis.hlen(self.pending_genres_key)
+            logger.info(f"Pending genres count: {count}")
+
+            # If we have enough for a batch, pop them
+            if count >= BATCH_SIZE:
+                # Get all pending genres
+                all_genres = await self.redis.hgetall(self.pending_genres_key)
+
+                # Take BATCH_SIZE items
+                batch = {}
+                keys_to_delete = []
+                for i, (artist_id, genres_json) in enumerate(all_genres.items()):
+                    if i >= BATCH_SIZE:
+                        break
+                    batch[artist_id] = json.loads(genres_json)
+                    keys_to_delete.append(artist_id)
+
+                # Delete the items we're returning
+                if keys_to_delete:
+                    await self.redis.hdel(self.pending_genres_key, *keys_to_delete)
+
+                logger.info(f"Returning batch of {len(batch)} artist genres for API")
+                return batch
+
+            return {}
+
+        except Exception as e:
+            logger.error(f"Error adding pending genres: {str(e)}")
+            return {}
+
+    async def get_pending_genres_count(self) -> int:
+        """Get current count of pending genres"""
+        if not self.redis:
+            await self.init()
+
+        try:
+            return await self.redis.hlen(self.pending_genres_key)
+        except Exception as e:
+            logger.error(f"Error getting pending genres count: {str(e)}")
             return 0

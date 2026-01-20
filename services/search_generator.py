@@ -1,90 +1,127 @@
-from typing import List
-from sqlalchemy import select, desc
+from typing import List, Set
+from sqlalchemy import select
 from models.database import SearchProgress
 from database.database import AsyncSessionLocal
 import os
+import csv
+import random
+import logging
 from dotenv import load_dotenv
 import multiprocessing
 
 
 load_dotenv()
+logger = logging.getLogger(__name__)
+
+# Path to the artist prefixes CSV file
+PREFIXES_CSV_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    'artist_prefixes.csv'
+)
+
 
 class SearchStringGenerator:
-    """Maintains search string state with batch generation starting with letters"""
+    """Generates search strings prioritizing 4-char prefixes from CSV, then random"""
     _instance = None
     _initialized = False
-    
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(SearchStringGenerator, cls).__new__(cls)
         return cls._instance
-    
+
     def __init__(self):
         if not self._initialized:
-            self.current = None
             self._initialized = True
             self.max_workers = min(
                 int(os.getenv('MAX_WORKERS', multiprocessing.cpu_count() * 2)),
-                10  # Cap at 10 due to Spotify API rate limits
+                20  # Cap at 20 concurrent searches
             )
-            # Define valid characters with letters first, then numbers
-            self.valid_chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
-    
-    @staticmethod
-    def char_increment(s: str) -> str:
-        """
-        Increment string with support for letters and numbers.
-        Goes from a-z, then 0-9.
-        """
-        if not s:
-            return 'a'  # Start with 'a' if empty
-            
-        # Convert last character to next in sequence
-        valid_chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
-        last_char = s[-1]
-        
-        if last_char not in valid_chars:
-            return s[:-1] + 'a'
-            
-        current_index = valid_chars.index(last_char)
-        if current_index < len(valid_chars) - 1:
-            return s[:-1] + valid_chars[current_index + 1]
-            
-        # If we've reached '9', increment the next position
-        return SearchStringGenerator.char_increment(s[:-1]) + 'a'
-    
+            self._prefixes: List[str] = []
+            self._four_char_prefixes: List[str] = []
+            self._other_prefixes: List[str] = []
+            self._prefixes_loaded = False
+
+    def _load_prefixes(self) -> None:
+        """Load prefixes from CSV file and separate 4-char from others"""
+        if self._prefixes_loaded:
+            return
+
+        try:
+            with open(PREFIXES_CSV_PATH, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                # Skip header
+                next(reader, None)
+
+                for row in reader:
+                    if row:
+                        prefix = row[0].strip()
+                        if prefix:
+                            self._prefixes.append(prefix)
+                            if len(prefix) == 4:
+                                self._four_char_prefixes.append(prefix)
+                            else:
+                                self._other_prefixes.append(prefix)
+
+            self._prefixes_loaded = True
+            logger.info(
+                f"Loaded {len(self._prefixes)} prefixes: "
+                f"{len(self._four_char_prefixes)} 4-char, "
+                f"{len(self._other_prefixes)} other"
+            )
+        except FileNotFoundError:
+            logger.warning(f"Prefixes CSV not found at {PREFIXES_CSV_PATH}, using empty list")
+            self._prefixes_loaded = True
+        except Exception as e:
+            logger.error(f"Error loading prefixes CSV: {e}")
+            self._prefixes_loaded = True
+
     async def initialize(self) -> None:
-        """Initialize search string state from database"""
-        if self.current is None:
-            async with AsyncSessionLocal() as session:
-                query = select(SearchProgress.query).order_by(desc(SearchProgress.query)).limit(1)
-                result = await session.execute(query)
-                last_search = result.scalar()
-                
-                # If no previous searches, start with 'aaaa'
-                # If there are previous searches, start with next string
-                if not last_search:
-                    self.current = 'aaaa'
-                else:
-                    self.current = last_search  # Next string will be generated in generate_batch
+        """Initialize by loading prefixes"""
+        self._load_prefixes()
+
+    async def _get_completed_searches(self) -> Set[str]:
+        """Get all completed search strings from the database"""
+        async with AsyncSessionLocal() as session:
+            query = select(SearchProgress.query)
+            result = await session.execute(query)
+            return {row[0] for row in result.fetchall()}
 
     async def generate_batch(self) -> List[str]:
-        """Generate a full batch of search strings based on available capacity"""
+        """
+        Generate a batch of search strings.
+        Priority: 4-character prefixes first, then random from remaining.
+        """
         await self.initialize()
+
+        # Get already completed searches
+        completed = await self._get_completed_searches()
+
         strings = []
-        current = self.current
-        
-        # For new searches (starting from 'aaaa'), include the first string
-        # For continuing searches, skip the first increment
-        if current == 'aaaa' and not strings:
-            strings.append(current)
-            current = self.char_increment(current)
-        
-        # Generate remaining strings up to max_workers
-        remaining = self.max_workers - len(strings)
-        for _ in range(remaining):
-            current = self.char_increment(current)
-            strings.append(current)
-            
-        self.current = current
+        needed = self.max_workers
+
+        # First, prioritize unsearched 4-character prefixes
+        unsearched_4char = [p for p in self._four_char_prefixes if p not in completed]
+        if unsearched_4char:
+            # Shuffle to randomize which 4-char strings we pick
+            random.shuffle(unsearched_4char)
+            batch_from_4char = unsearched_4char[:needed]
+            strings.extend(batch_from_4char)
+            logger.info(f"Selected {len(batch_from_4char)} 4-char prefixes")
+
+        # If we still need more, pick randomly from other unsearched prefixes
+        if len(strings) < needed:
+            remaining_needed = needed - len(strings)
+            unsearched_other = [p for p in self._other_prefixes if p not in completed]
+
+            if unsearched_other:
+                random.shuffle(unsearched_other)
+                batch_from_other = unsearched_other[:remaining_needed]
+                strings.extend(batch_from_other)
+                logger.info(f"Selected {len(batch_from_other)} other prefixes")
+
+        # If we've exhausted all CSV prefixes, log a warning
+        if not strings:
+            logger.warning("All prefixes from CSV have been searched!")
+
         return strings
